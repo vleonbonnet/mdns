@@ -428,24 +428,26 @@ func (c *client) query(params *QueryParam) error {
 	for {
 		select {
 		case resp := <-msgCh:
-			for _, e := range l.handle(resp.msg, resp.src) {
-				select {
-				case params.Entries <- e:
-				default:
-				}
-			}
+			l.handle(resp.msg, resp.src)
 		case <-resend.C:
 		case <-finish:
 			return nil
 		case <-c.closedCh: // context cancelled
 			return nil
 		}
-		for _, q := range l.followUps(time.Now()) {
+		now := time.Now()
+		for _, q := range l.followUps(now) {
 			m := new(dns.Msg)
 			m.SetQuestion(q.name, q.qtype)
 			m.RecursionDesired = false
 			if err := c.sendQuery(m); err != nil {
 				c.log.Printf("[ERR] mdns: Failed to query %s %s: %v", q.name, dns.TypeToString[q.qtype], err)
+			}
+		}
+		for _, e := range l.ready(now) {
+			select {
+			case params.Entries <- e:
+			default:
 			}
 		}
 	}
@@ -473,6 +475,12 @@ const (
 // out: SRV and TXT for the instance name, then A and AAAA for the SRV target.
 // (Upstream re-asked PTR for the instance name, which no responder holds, so
 // it never completed entries from a responder like systemd-resolved.)
+//
+// An entry is handed out once it has both address families, or once the
+// missing family's question has gone unanswered: upstream handed it out at
+// the first address, so which family a caller got depended on which answer
+// arrived first, and a caller filtering on one family (go-discover with
+// v6=false, as Consul's retry_join uses it) could miss the entry.
 type lookup struct {
 	service string                   // the queried name, lower case, e.g. "_consul._tcp.local."
 	entries map[string]*ServiceEntry // by lower-case instance name and SRV target
@@ -499,16 +507,14 @@ func newLookup(service string) *lookup {
 	}
 }
 
-// handle folds one response into the lookup and returns the entries it
-// completed. PTR records are read first, so records that arrive in the
-// same message ahead of their PTR are not dropped.
-func (l *lookup) handle(msg *dns.Msg, src *net.UDPAddr) []*ServiceEntry {
+// handle folds one response into the lookup. PTR records are read first, so
+// records that arrive in the same message ahead of their PTR are not dropped.
+func (l *lookup) handle(msg *dns.Msg, src *net.UDPAddr) {
 	records := append(append([]dns.RR{}, msg.Answer...), msg.Extra...)
-	touched := make(map[*ServiceEntry]bool)
 	for _, rr := range records {
 		if ptr, ok := rr.(*dns.PTR); ok && strings.EqualFold(ptr.Hdr.Name, l.service) {
 			l.valid[strings.ToLower(ptr.Ptr)] = true
-			touched[l.entry(ptr.Ptr)] = true
+			l.entry(ptr.Ptr)
 		}
 	}
 	for _, answer := range records {
@@ -527,20 +533,17 @@ func (l *lookup) handle(msg *dns.Msg, src *net.UDPAddr) []*ServiceEntry {
 			}
 			inp.Host = rr.Target
 			inp.Port = int(rr.Port)
-			touched[inp] = true
 
 		case *dns.TXT:
 			inp := l.entry(rr.Hdr.Name)
 			inp.Info = strings.Join(rr.Txt, "|")
 			inp.InfoFields = rr.Txt
 			inp.hasTXT = true
-			touched[inp] = true
 
 		case *dns.A:
 			inp := l.entry(rr.Hdr.Name)
 			inp.Addr = rr.A // @Deprecated
 			inp.AddrV4 = rr.A
-			touched[inp] = true
 
 		case *dns.AAAA:
 			inp := l.entry(rr.Hdr.Name)
@@ -554,17 +557,39 @@ func (l *lookup) handle(msg *dns.Msg, src *net.UDPAddr) []*ServiceEntry {
 			if (rr.AAAA.IsLinkLocalUnicast() || rr.AAAA.IsLinkLocalMulticast()) && src != nil {
 				inp.AddrV6IPAddr.Zone = src.Zone
 			}
-			touched[inp] = true
 		}
 	}
-	var done []*ServiceEntry
-	for inp := range touched {
-		if inp.complete() && !inp.sent {
-			inp.sent = true
-			done = append(done, inp)
+}
+
+// ready returns the entries to hand out now, each once: complete, and with
+// both address families or the missing one's question gone unanswered.
+func (l *lookup) ready(now time.Time) []*ServiceEntry {
+	var out []*ServiceEntry
+	for _, inp := range l.entries {
+		if inp.sent || !inp.complete() || !l.settled(inp, now) {
+			continue
 		}
+		inp.sent = true
+		out = append(out, inp)
 	}
-	return done
+	return out
+}
+
+// settled reports whether inp's address families are known: each one either
+// answered, or asked followUpTries times with the last ask followUpResend ago.
+// An entry without an SRV target (its addresses came under the instance name)
+// cannot be asked further and counts as settled.
+func (l *lookup) settled(inp *ServiceEntry, now time.Time) bool {
+	if inp.Host == "" {
+		return true
+	}
+	return (inp.AddrV4 != nil || l.exhausted(inp.Host, dns.TypeA, now)) &&
+		(inp.AddrV6 != nil || l.exhausted(inp.Host, dns.TypeAAAA, now))
+}
+
+func (l *lookup) exhausted(name string, qtype uint16, now time.Time) bool {
+	a := l.asked[question{strings.ToLower(name), qtype}]
+	return a != nil && a.times >= followUpTries && now.Sub(a.last) >= followUpResend
 }
 
 // entry returns the in-progress entry for name, creating it.
@@ -578,9 +603,10 @@ func (l *lookup) entry(name string) *ServiceEntry {
 	return inp
 }
 
-// followUps returns the questions to send now for the entries still
-// incomplete: SRV and TXT for the instance, A and AAAA for its target. Each
-// question is asked at most followUpTries times, followUpResend apart.
+// followUps returns the questions to send now for the entries not handed out
+// yet: SRV and TXT for the instance, and A and AAAA for its target while that
+// family is missing. Each question is asked at most followUpTries times,
+// followUpResend apart.
 func (l *lookup) followUps(now time.Time) []question {
 	var out []question
 	seen := make(map[*ServiceEntry]bool)
@@ -596,8 +622,11 @@ func (l *lookup) followUps(now time.Time) []question {
 		if !inp.hasTXT {
 			need = append(need, question{inp.Name, dns.TypeTXT})
 		}
-		if inp.Host != "" && inp.AddrV4 == nil && inp.AddrV6 == nil {
-			need = append(need, question{inp.Host, dns.TypeA}, question{inp.Host, dns.TypeAAAA})
+		if inp.Host != "" && inp.AddrV4 == nil {
+			need = append(need, question{inp.Host, dns.TypeA})
+		}
+		if inp.Host != "" && inp.AddrV6 == nil {
+			need = append(need, question{inp.Host, dns.TypeAAAA})
 		}
 		for _, q := range need {
 			key := question{strings.ToLower(q.name), q.qtype}
