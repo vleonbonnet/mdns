@@ -418,114 +418,203 @@ func (c *client) query(params *QueryParam) error {
 		return err
 	}
 
-	// Map the in-progress responses
-	inprogress := make(map[string]*ServiceEntry)
-
-	// Track names that belong to the queried service. Only entries
-	// reachable from a matching PTR record are processed; this
-	// prevents unrelated mDNS responses on the network from
-	// polluting the results.
-	validNames := make(map[string]bool)
+	l := newLookup(serviceAddr)
+	// The ticker resends follow-up questions whose answers got lost.
+	resend := time.NewTicker(followUpResend / 2)
+	defer resend.Stop()
 
 	// Listen until we reach the timeout
 	finish := time.After(params.Timeout)
 	for {
 		select {
 		case resp := <-msgCh:
-			var inp *ServiceEntry
-			for _, answer := range append(resp.msg.Answer, resp.msg.Extra...) {
-				switch rr := answer.(type) {
-				case *dns.PTR:
-					// Only accept PTR records for the service we queried.
-					if !strings.EqualFold(rr.Hdr.Name, serviceAddr) {
-						continue
-					}
-					validNames[rr.Ptr] = true
-					inp = ensureName(inprogress, rr.Ptr)
-
-				case *dns.SRV:
-					if !validNames[rr.Hdr.Name] {
-						continue
-					}
-					// The SRV target (hostname) is also valid for A/AAAA lookups
-					validNames[rr.Target] = true
-					// Check for a target mismatch
-					if rr.Target != rr.Hdr.Name {
-						alias(inprogress, rr.Hdr.Name, rr.Target)
-					}
-
-					// Get the port
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Host = rr.Target
-					inp.Port = int(rr.Port)
-
-				case *dns.TXT:
-					if !validNames[rr.Hdr.Name] {
-						continue
-					}
-					// Pull out the txt
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Info = strings.Join(rr.Txt, "|")
-					inp.InfoFields = rr.Txt
-					inp.hasTXT = true
-
-				case *dns.A:
-					if !validNames[rr.Hdr.Name] {
-						continue
-					}
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.A // @Deprecated
-					inp.AddrV4 = rr.A
-
-				case *dns.AAAA:
-					if !validNames[rr.Hdr.Name] {
-						continue
-					}
-					// Pull out the IP
-					inp = ensureName(inprogress, rr.Hdr.Name)
-					inp.Addr = rr.AAAA   // @Deprecated
-					inp.AddrV6 = rr.AAAA // @Deprecated
-					inp.AddrV6IPAddr = &net.IPAddr{IP: rr.AAAA}
-					// link-local IPv6 addresses must be qualified with a zone (interface). Zone is
-					// specific to this machine/network-namespace and so won't be carried in the
-					// mDNS message itself. We borrow the zone from the source address of the UDP
-					// packet, as the link-local address should be valid on that interface.
-					if rr.AAAA.IsLinkLocalUnicast() || rr.AAAA.IsLinkLocalMulticast() {
-						inp.AddrV6IPAddr.Zone = resp.src.Zone
-					}
-				}
-			}
-
-			if inp == nil {
-				continue
-			}
-
-			// Check if this entry is complete
-			if inp.complete() {
-				if inp.sent {
-					continue
-				}
-				inp.sent = true
+			for _, e := range l.handle(resp.msg, resp.src) {
 				select {
-				case params.Entries <- inp:
+				case params.Entries <- e:
 				default:
 				}
-			} else {
-				// Fire off a node specific query
-				m := new(dns.Msg)
-				m.SetQuestion(inp.Name, dns.TypePTR)
-				m.RecursionDesired = false
-				if err := c.sendQuery(m); err != nil {
-					c.log.Printf("[ERR] mdns: Failed to query instance %s: %v", inp.Name, err)
-				}
 			}
+		case <-resend.C:
 		case <-finish:
 			return nil
 		case <-c.closedCh: // context cancelled
 			return nil
 		}
+		for _, q := range l.followUps(time.Now()) {
+			m := new(dns.Msg)
+			m.SetQuestion(q.name, q.qtype)
+			m.RecursionDesired = false
+			if err := c.sendQuery(m); err != nil {
+				c.log.Printf("[ERR] mdns: Failed to query %s %s: %v", q.name, dns.TypeToString[q.qtype], err)
+			}
+		}
 	}
+}
+
+// Follow-up questions for an incomplete entry are asked at most
+// followUpTries times, followUpResend apart.
+const (
+	followUpTries  = 2
+	followUpResend = time.Second
+)
+
+// lookup is the progress of one service query: the entries found so far
+// and the follow-up questions asked for them.
+//
+// Only names reachable from a PTR record for the queried service are
+// accepted (the instance names, then their SRV targets), so unrelated mDNS
+// traffic on the link cannot add entries; see hashicorp/mdns#96. Names are
+// compared case-insensitively, as DNS names are.
+//
+// A responder is not required to answer a PTR question with the instance's
+// SRV, TXT and address records; RFC 6763 section 12 only recommends adding
+// them. avahi does, systemd-resolved does not. For an entry still missing
+// records the client therefore asks for them, as RFC 6763 section 4 lays
+// out: SRV and TXT for the instance name, then A and AAAA for the SRV target.
+// (Upstream re-asked PTR for the instance name, which no responder holds, so
+// it never completed entries from a responder like systemd-resolved.)
+type lookup struct {
+	service string                   // the queried name, lower case, e.g. "_consul._tcp.local."
+	entries map[string]*ServiceEntry // by lower-case instance name and SRV target
+	valid   map[string]bool          // lower-case names accepted in records
+	asked   map[question]*asked
+}
+
+type question struct {
+	name  string
+	qtype uint16
+}
+
+type asked struct {
+	times int
+	last  time.Time
+}
+
+func newLookup(service string) *lookup {
+	return &lookup{
+		service: strings.ToLower(service),
+		entries: make(map[string]*ServiceEntry),
+		valid:   make(map[string]bool),
+		asked:   make(map[question]*asked),
+	}
+}
+
+// handle folds one response into the lookup and returns the entries it
+// completed. PTR records are read first, so records that arrive in the
+// same message ahead of their PTR are not dropped.
+func (l *lookup) handle(msg *dns.Msg, src *net.UDPAddr) []*ServiceEntry {
+	records := append(append([]dns.RR{}, msg.Answer...), msg.Extra...)
+	touched := make(map[*ServiceEntry]bool)
+	for _, rr := range records {
+		if ptr, ok := rr.(*dns.PTR); ok && strings.EqualFold(ptr.Hdr.Name, l.service) {
+			l.valid[strings.ToLower(ptr.Ptr)] = true
+			touched[l.entry(ptr.Ptr)] = true
+		}
+	}
+	for _, answer := range records {
+		name := strings.ToLower(answer.Header().Name)
+		if !l.valid[name] {
+			continue
+		}
+		switch rr := answer.(type) {
+		case *dns.SRV:
+			// The SRV target (hostname) is also valid for A/AAAA lookups.
+			inp := l.entry(rr.Hdr.Name)
+			target := strings.ToLower(rr.Target)
+			l.valid[target] = true
+			if target != name {
+				l.entries[target] = inp
+			}
+			inp.Host = rr.Target
+			inp.Port = int(rr.Port)
+			touched[inp] = true
+
+		case *dns.TXT:
+			inp := l.entry(rr.Hdr.Name)
+			inp.Info = strings.Join(rr.Txt, "|")
+			inp.InfoFields = rr.Txt
+			inp.hasTXT = true
+			touched[inp] = true
+
+		case *dns.A:
+			inp := l.entry(rr.Hdr.Name)
+			inp.Addr = rr.A // @Deprecated
+			inp.AddrV4 = rr.A
+			touched[inp] = true
+
+		case *dns.AAAA:
+			inp := l.entry(rr.Hdr.Name)
+			inp.Addr = rr.AAAA   // @Deprecated
+			inp.AddrV6 = rr.AAAA // @Deprecated
+			inp.AddrV6IPAddr = &net.IPAddr{IP: rr.AAAA}
+			// link-local IPv6 addresses must be qualified with a zone (interface). Zone is
+			// specific to this machine/network-namespace and so won't be carried in the
+			// mDNS message itself. We borrow the zone from the source address of the UDP
+			// packet, as the link-local address should be valid on that interface.
+			if (rr.AAAA.IsLinkLocalUnicast() || rr.AAAA.IsLinkLocalMulticast()) && src != nil {
+				inp.AddrV6IPAddr.Zone = src.Zone
+			}
+			touched[inp] = true
+		}
+	}
+	var done []*ServiceEntry
+	for inp := range touched {
+		if inp.complete() && !inp.sent {
+			inp.sent = true
+			done = append(done, inp)
+		}
+	}
+	return done
+}
+
+// entry returns the in-progress entry for name, creating it.
+func (l *lookup) entry(name string) *ServiceEntry {
+	key := strings.ToLower(name)
+	if inp, ok := l.entries[key]; ok {
+		return inp
+	}
+	inp := &ServiceEntry{Name: name}
+	l.entries[key] = inp
+	return inp
+}
+
+// followUps returns the questions to send now for the entries still
+// incomplete: SRV and TXT for the instance, A and AAAA for its target. Each
+// question is asked at most followUpTries times, followUpResend apart.
+func (l *lookup) followUps(now time.Time) []question {
+	var out []question
+	seen := make(map[*ServiceEntry]bool)
+	for _, inp := range l.entries {
+		if inp.sent || seen[inp] {
+			continue
+		}
+		seen[inp] = true
+		var need []question
+		if inp.Port == 0 {
+			need = append(need, question{inp.Name, dns.TypeSRV})
+		}
+		if !inp.hasTXT {
+			need = append(need, question{inp.Name, dns.TypeTXT})
+		}
+		if inp.Host != "" && inp.AddrV4 == nil && inp.AddrV6 == nil {
+			need = append(need, question{inp.Host, dns.TypeA}, question{inp.Host, dns.TypeAAAA})
+		}
+		for _, q := range need {
+			key := question{strings.ToLower(q.name), q.qtype}
+			a := l.asked[key]
+			if a == nil {
+				a = &asked{}
+				l.asked[key] = a
+			}
+			if a.times >= followUpTries || (a.times > 0 && now.Sub(a.last) < followUpResend) {
+				continue
+			}
+			a.times++
+			a.last = now
+			out = append(out, q)
+		}
+	}
+	return out
 }
 
 // sendQuery is used to multicast a query out
@@ -595,22 +684,4 @@ func (c *client) recv(l *net.UDPConn, msgCh chan *msgAddr) {
 			return
 		}
 	}
-}
-
-// ensureName is used to ensure the named node is in progress
-func ensureName(inprogress map[string]*ServiceEntry, name string) *ServiceEntry {
-	if inp, ok := inprogress[name]; ok {
-		return inp
-	}
-	inp := &ServiceEntry{
-		Name: name,
-	}
-	inprogress[name] = inp
-	return inp
-}
-
-// alias is used to setup an alias between two entries
-func alias(inprogress map[string]*ServiceEntry, src, dst string) {
-	srcEntry := ensureName(inprogress, src)
-	inprogress[dst] = srcEntry
 }
